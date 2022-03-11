@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Jan  2 15:07:48 2022
+
+@author: supratim
+"""
+
+import numpy as np
+import shutil
+import os
+from glob import glob
+import cv2
+import torch
+import torch.nn as nn
+import re
+from imutils import face_utils
+from torch.utils.data import Dataset
+import dlib
+import torchvision.transforms as transforms
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from augmentation import AllAugmentationTransform
+from logger import Logger
+from models import Generator, Discriminator_faces, Discriminator_marks
+import face_alignment
+import face_detection
+
+def face_detect(frame):
+    frame1 = np.expand_dims(frame, axis=0)
+    preds = fa.get_detections_for_batch(np.asarray(frame1))
+    for j, f in enumerate(preds):
+        if f is None:
+            continue
+                        #x1, y1, x2, y2 = f
+        y1 = max(0, f[1] - pady1)
+        y2 = min(frame1.shape[1], f[3] + pady2)
+        x1 = max(0, f[0] - padx1)
+        x2 = min(frame1.shape[2], f[2] + padx2)
+        frame_crop = frame[y1:y2, x1:x2]
+    
+    return frame_crop
+
+
+def get_landmarks_image(img):
+        img_1 = np.zeros([128,128,1],dtype=np.uint8)
+        img_1.fill(0)
+        preds = fa_lm.get_landmarks(img)
+        if len(preds)==0:
+          print('Landmark not detected')
+        else:
+          for i,f in enumerate(preds[0]):
+            if i in LAND_MARKS_INDEXES:
+              x=f[0]
+              y=f[1]
+              img_1 =cv2.circle(img_1, (x,y), 3, (255,0,0), -1)
+        return img_1
+
+LAND_MARKS_INDEXES = [36, 39, 42, 45, 31, 35, 48, 51, 54, 57]
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+logger = Logger(log_dir='log')
+
+pady1, pady2, padx1, padx2 = 10, 20, 20, 20
+
+IMG_WHT=128
+ETA = 0.001
+
+gen = Generator(IMG_WHT, ETA)
+
+G = nn.DataParallel(gen).to(device)
+
+checkpoint = 'log/final_test_2_lm-checkpoint.pth.tar'
+
+if os.path.exists(checkpoint):
+    print('loading checkpoints')
+    start_epoch = Logger.load_cpk(checkpoint, G)
+else:
+    print('No checkpoint for validation')
+G.eval()      
+
+
+root_dir = 'preprocessed/validation'
+IMG_DIM = (128, 128)
+
+fa = face_detection.FaceAlignment(face_detection.LandmarksType._2D, flip_input=False, device=device)
+fa_lm = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False, device=device)
+
+if os.path.exists(root_dir):
+    #print(os.path.join(root_dir, 'train'))
+    video_list = glob(os.path.join(root_dir, '*.mp4'))
+    for video in video_list:
+        vid_name = video.split('.')[0].split('/')[-1]
+        print(vid_name)
+        save_path = os.path.join(root_dir,vid_name+'_generated.avi')
+        save_path_face = os.path.join(root_dir,vid_name+'_face.avi')
+      
+        video_stream = cv2.VideoCapture(video)
+        fps = video_stream.get(cv2.CAP_PROP_FPS)
+
+        out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'DIVX'), fps, (128, 128))
+        out_face = cv2.VideoWriter(save_path_face, cv2.VideoWriter_fourcc(*'DIVX'), fps, (128, 128))
+        
+        frame_num = -1
+        while 1:
+            still_reading, frame = video_stream.read()
+            if still_reading:
+                frame_num+=1
+                print(frame_num)
+                if frame_num == 0:
+                    
+                    frame_crop = face_detect(frame)
+                    frame_crop=cv2.resize(frame_crop, IMG_DIM, interpolation = cv2.INTER_AREA)
+                    f1 = (frame_crop).astype(np.uint8)
+                    out_face.write(f1)
+                    out.write(f1)
+
+                    src_lm = get_landmarks_image(frame_crop)
+                    src_lm = torch.tensor(np.transpose(src_lm, [2,0,1]), dtype=torch.float32)
+                    src_lm = src_lm.unsqueeze(axis=0)
+                    #print(src_lm.shape)
+                    
+                    src_image = torch.tensor(np.transpose(frame_crop, [2,0,1]), dtype=torch.float32)
+                    src_image = src_image.unsqueeze(axis=0)
+                    #print(src_image.shape)
+                    #print('source image:',src_image.type())
+                else:
+                    
+                    frame_crop = face_detect(frame)
+                    frame_crop=cv2.resize(frame_crop, IMG_DIM, interpolation = cv2.INTER_AREA)
+                    f1 = (frame_crop).astype(np.uint8)
+                    out_face.write(f1)
+
+                    target_lm = get_landmarks_image(frame_crop)
+                    target_lm = torch.tensor(np.transpose(target_lm, [2,0,1]), dtype=torch.float32)
+                    target_lm = target_lm.unsqueeze(axis=0)
+                    #print('target_lm:',target_lm.shape)
+
+                    target_image = torch.tensor(np.transpose(frame_crop, [2,0,1]), dtype=torch.float32)
+                    target_image = target_image.unsqueeze(axis=0)
+
+                    #print('source image:',type(src_image))
+                    #print('source lm:',type(src_lm))
+                    #print('target image',type(target_image))
+                    #print('target lm',type(target_lm))
+
+                    with torch.no_grad():
+                        _, _, gen_image = G(src_image, src_lm, target_lm)
+                    
+                    #print(gen_image)
+                    gen_image = gen_image.squeeze(axis=0)
+                    gen_image = gen_image.detach().numpy()
+                    gen_image = np.transpose(gen_image,[1,2,0])
+                    
+                    gen_image = (gen_image).astype(np.uint8)
+                    print(gen_image.shape)
+                    
+                    out.write(gen_image)
+                            
+            else:
+                out.release()
+                out_face.release()
+                video_stream.release()
+                break
+    # videos = os.listdir(os.path.join(root_dir, 'images'))
+    # lms = os.listdir(os.path.join(root_dir, 'landmarks'))
+    # img_list = glob(os.path.join(path, '*.jpg'))
+    # img_list.sort(key=lambda f: int(re.sub('\D', '', f)))
+    # lm_list = glob(os.path.join(path_lm, '*.jpg'))
+    # lm_list.sort(key=lambda f: int(re.sub('\D', '', f)))
+    
+    # for i, img in enumerate(img_list):
+    #     if i==0:
+    #         print('source image:', img)
+    #         print('source lm:',lm_list[i])
+    #         src_image = cv2.imread(img)
+    #         src_lm = cv2.imread(lm_list[i])
+    #     else:
+    #         print('target image:', img)
+    #         print('target lm:',lm_list[i])
+    #         target_image = cv2.imread(img)
+    #         target_lm = cv2.imread(lm_list[i])
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
